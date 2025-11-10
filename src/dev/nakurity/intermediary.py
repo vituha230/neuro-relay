@@ -2,12 +2,20 @@
 import asyncio
 import json
 import traceback
+import uuid
+
 from typing import Dict, Any, Optional
 
 import websockets
 from websockets.server import WebSocketServerProtocol
 from ..utils.loadconfig import load_config
-from .linker import NakurityLink
+
+from .client import NakurityClient
+from .server import NakurityBackend
+
+from neuro_api.server import RegisterActionsData
+
+
 
 """
 Intermediary WebSocket server:
@@ -34,12 +42,13 @@ class Intermediary:
         self.port = port
         # name -> websocket for integrations
         self.integrations: Dict[str, WebSocketServerProtocol] = {}
+
         # neuro-os watchers (could be multiple monitoring UIs)
         self.watchers: Dict[str, WebSocketServerProtocol] = {}
 
         # internal routing hooks (can be replaced by Neuro-OS)
         # `forward_to_neuro` should be an async callable taking (payload: dict) -> optional response
-        self.forward_to_neuro = None  # set by server layer
+        #self.forward_to_neuro = None  # set by server layer
 
         # persistent queues, help manage the chokepoint where all integration messages
         # goes pass neuro-relay. It is a relay integration after all.
@@ -54,7 +63,120 @@ class Intermediary:
         # from the Nakurity Backend.
         self.action_registry: Dict[str, Dict[str, Any]] = {}
 
-        self.nakurity_outbound_client: NakurityLink
+        #self.nakurity_outbound_client: NakurityLink
+
+        self.nakurity_client: NakurityClient
+        self.nakurity_backend: NakurityBackend
+
+        self.queue_client = asyncio.Queue() #messages from client
+        self.queue_backend = asyncio.Queue() #messages from backend
+        #self.queue_watchers = asyncio.Queue() #data from watchers HANDLED WITHOUT A QUEUE 
+
+        self.traffic = asyncio.Queue()
+        self._bg_task = None
+
+
+
+    #interfaces
+    async def client_to_intermediary(self, payload: dict):
+        #called by client: client forwards data to intermediary
+        await self.queue_client.put(payload)
+
+    async def backend_to_intermediary(self, payload: dict):
+        print("[INTERMEDIARY] backend_to_intermediary")
+        #called by backend: backend forwards data to intermediary
+        await self.queue_backend.put(payload)      
+
+
+    #forward register actions to client
+    async def register_actions(self, actions_schema: dict):
+        await self.nakurity_client.register_actions(actions_schema)
+
+
+
+    #queue processing
+    async def process_queue_client(self):
+        while True:
+            if True: #not self.queue_client.empty():
+                item = await self.queue_client.get()
+                try:
+                    if hasattr(self, 'nakurity_backend'):
+                        await self.nakurity_backend.intermediary_to_backend(msg=item) #forward data to backend #TODO: processing
+                    else:    
+                        while not hasattr(self, 'nakurity_backend'):
+                            await asyncio.sleep(0.5)
+
+                except Exception:
+                    print("[INTERMEDIARY] could not forward message to backend:")
+                    traceback.print_exc()
+                
+                    while not hasattr(self, 'nakurity_backend'):
+                        await asyncio.sleep(0.5)
+
+
+    async def process_queue_backend(self):
+        while True:
+            if True: #not self.queue_backend.empty():
+                item = await self.queue_backend.get()
+                print("[INTERMEDIARY] got message from backend")
+                try:
+                    if hasattr(self, 'nakurity_client'):
+                        await self.nakurity_client.intermediary_to_client(msg=item) #forward data to client #TODO: processing
+                    else:    
+                        while not hasattr(self, 'nakurity_client'):
+                            await asyncio.sleep(0.5)
+
+                except Exception:
+                    print("[INTERMEDIARY] could not forward message to client:")
+                    traceback.print_exc()
+
+                    while not hasattr(self, 'nakurity_client'):
+                        await asyncio.sleep(0.5)
+
+                    await asyncio.sleep(1.0)    
+
+            
+    """
+    async def process_queue_watchers(self):
+        while True:
+            item = await self.queue_watchers.get()
+
+            # Check for direct-to-neuro message (enhanced privilege)
+            if item.get("direct_to_neuro") and item.get("payload"):
+                print(f"[Intermediary] {watcher_name} sending direct message to Neuro backend")
+                # Forward directly to Nakurity Client → Neuro Backend
+                try:
+                    #if hasattr(self, "nakurity_outbound_client") and self.nakurity_outbound_client:
+                    if True:
+                        await self.send_event({
+                            "event": "neuroos_direct_message",
+                            "from": watcher_name,
+                            "data": item["payload"]
+                        })
+                        await ws.send(json.dumps({"status": "forwarded_to_neuro"}))
+                    else:
+                        await ws.send(json.dumps({"error": "neuro backend not available"}))
+                except Exception:
+                    traceback.print_exc()
+                    await ws.send(json.dumps({"error": "failed to forward to neuro backend"}))
+                continue
+
+            # Regular integration targeting
+            target = item.get("target")
+            cmd = item.get("cmd")
+            if target and cmd and target in self.integrations:
+                try:
+                    await self.integrations[target].send(json.dumps({
+                        "from_watcher": watcher_name,
+                        "cmd": cmd
+                    }))
+                    await ws.send(json.dumps({"status": "sent"}))
+                except Exception:
+                    await ws.send(json.dumps({"error": "failed to deliver to integration"}))
+            else:
+                await ws.send(json.dumps({"error": "invalid target/cmd"}))
+    """
+
 
     def _load_persisted_queue(self):
         if QUEUE_FILE.exists():
@@ -76,6 +198,8 @@ class Intermediary:
         self.queue = qcopy
         QUEUE_FILE.write_bytes(pickle.dumps(items))
 
+
+
     async def collect_registered_actions(self) -> dict:
         """Return a unified action schema for all integrations."""
         unified = {}
@@ -84,6 +208,8 @@ class Intermediary:
                 # Prefix action name with integration namespace
                 unified[f"{integration}.{act_name}"] = schema
         return unified
+
+
 
     async def _register(self, ws: WebSocketServerProtocol) -> Optional[Dict[str, Any]]:
         raw = await ws.recv()
@@ -185,8 +311,8 @@ class Intermediary:
 
             # Forward to the real Neuro backend via Nakurity Client (outbound)
             try:
-                if hasattr(self, "nakurity_outbound_client") and self.nakurity_outbound_client:
-                    await self.nakurity_outbound_client.send_event({
+                if True:
+                    await self.send_event({
                         "event": "integration_message",
                         "from": origin_name,
                         "data": payload
@@ -216,8 +342,9 @@ class Intermediary:
                 print(f"[Intermediary] {watcher_name} sending direct message to Neuro backend")
                 # Forward directly to Nakurity Client → Neuro Backend
                 try:
-                    if hasattr(self, "nakurity_outbound_client") and self.nakurity_outbound_client:
-                        await self.nakurity_outbound_client.send_event({
+                    #if hasattr(self, "nakurity_outbound_client") and self.nakurity_outbound_client:
+                    if True:
+                        await self.send_event({
                             "event": "neuroos_direct_message",
                             "from": watcher_name,
                             "data": payload["payload"]
@@ -275,7 +402,11 @@ class Intermediary:
         """
         Start the intermediary WebSocket server and set an internal 'ready' event when bound.
         """
+        print("[INTERMEDIARY] start...")
         asyncio.create_task(self.retry_queue())
+        asyncio.create_task(self.process_queue_backend())
+        asyncio.create_task(self.process_queue_client())
+        print("[INTERMEDIARY] async tasks created...")
 
         # ensure we have an event users can await to know when server is ready
         self._ready_event = asyncio.Event()
@@ -299,8 +430,8 @@ class Intermediary:
             self._ready_event.set()
             raise
 
-    async def send_outbound(self, payload: dict):
-        self.nakurity_outbound_client
+    #async def send_outbound(self, payload: dict):
+    #    self.nakurity_outbound_client
 
     # Helpers to send messages to integrations from the server layer
     async def send_to_integration(self, name: str, payload: dict):
@@ -336,9 +467,164 @@ class Intermediary:
             except Exception:
                 self.integrations.pop(name, None)
 
+
     async def wait_until_ready(self, timeout: float = 5.0):
         """Await until the server is ready (bounded) or raise on timeout."""
         if self._ready_event is None:
             # start() hasn't been called yet; immediate return or create+wait might be used
             self._ready_event = asyncio.Event()
         await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
+
+
+
+    async def register_actions(self, data: dict):
+        actions = data.get("actions", {})
+        traffic_id = uuid.uuid4()
+        await self.traffic.put({
+            "traffic_id": str(traffic_id),
+            "type": "register_actions",
+            "payload": actions
+        })
+
+
+    async def send_event(self, data: dict):
+        event = data.get("event")
+        payload = data.get("data", {})
+        from_integration = data.get("from", "unknown")
+        traffic_id = uuid.uuid4()
+        await self.traffic.put({
+            "traffic_id": str(traffic_id),
+            "type": "event",
+            "event": event,
+            "from": from_integration,
+            "payload": payload
+        })
+
+    # ---------------------- #
+    #   Background Handling  #
+    # ---------------------- #
+    async def _handle_traffic(self):
+        """Continuously handle traffic items queued by API routes."""
+        while True:
+            item = await self.traffic.get()
+            try:
+                print(f"[Nakurity Link] Processing traffic item {item['traffic_id']} ({item['type']})")
+                if not self.nakurity_client:
+                    # no outbound client yet; requeue and wait a bit  
+                    print(f"[Nakurity Link] No client available, requeuing traffic item {item['traffic_id']}")
+                    await asyncio.sleep(2.0)  # Increased delay
+                    await self.traffic.put(item)
+                    continue
+
+                if item["type"] == "register_actions":
+                    # forward action schema to real Neuro via NakurityClient
+                    # Payload is the actions list directly - pass it to register_actions
+                    payload = item.get("payload", [])
+                    if isinstance(payload, list):
+                        # Convert list to format expected by register_actions (which expects actions in data.actions)
+                        await self.nakurity_client.intermediary_to_client(
+                            #__import__("json").dumps({
+                            {
+                                "command": "actions/register",
+                                "game": self.nakurity_client.name,
+                                "data": {"actions": payload}
+                            }
+                            #}).encode()
+                        )
+                        print(f"[Nakurity Link] Forwarded {len(payload)} actions to Neuro backend")
+                    else:
+                        print(f"[Nakurity Link] ERROR: Expected list of actions, got {type(payload)}")
+                elif item["type"] == "event":
+                    # wrap generic integration event and forward to Neuro via context command
+                    event_type = item.get("event")
+                    payload_data = item.get("payload", {})
+                    from_integration = item.get("from", "unknown")
+                    
+                    # Create a context message that Neuro can understand
+                    if event_type == "integration_message":
+                        # For integration messages, extract the actual command/action
+                        if payload_data.get("op") == "choose_force_action":
+                            # Convert choose_force_action to actions/force format
+                            actions = payload_data.get("actions", [])
+                            action_names = [a.get("name", "") for a in actions if "name" in a]
+                            payload = {
+                                "command": "actions/force",
+                                "game": self.nakurity_client.name,
+                                "data": {
+                                    "state": __import__("json").dumps(payload_data.get("state", {})),
+                                    "query": payload_data.get("query", "Choose an action"),
+                                    "action_names": action_names,
+                                    "ephemeral_context": bool(payload_data.get("ephemeral_context"))
+                                }
+                            }
+                        else:
+                            # For other integration messages, send as context with better formatting
+                            if payload_data.get("command") == "startup":
+                                game_title = payload_data.get("game", "unknown-game")
+                                message = f"🎮 Integration '{from_integration}' connected with game '{game_title}'"
+                            elif payload_data.get("status") == "ready":
+                                game_title = payload_data.get("game", from_integration)
+                                message = f"✅ Integration '{game_title}' is ready via relay"
+                            else:
+                                message = f"📨 Message from integration '{from_integration}': {__import__('json').dumps(payload_data)}"
+                            
+                            payload = {
+                                "command": "context",
+                                "game": self.nakurity_client.name,
+                                "data": {
+                                    "message": message,
+                                    "silent": True  # Keep integration messages quieter
+                                }
+                            }
+                    else:
+                        # For other event types, send as context with better formatting
+                        if event_type == "integration_connected":
+                            message = f"🔌 Integration '{from_integration}' connected to relay"
+                        elif event_type == "integration_disconnected":
+                            message = f"🔌 Integration '{from_integration}' disconnected from relay"
+                        elif event_type == "action_test":
+                            message = f"🧪 Testing action '{payload_data.get('action', 'unknown')}' from integration '{from_integration}'"
+                        else:
+                            message = f"📡 Event '{event_type}' from integration '{from_integration}': {__import__('json').dumps(payload_data)}"
+                        
+                        payload = {
+                            "command": "context",
+                            "game": self.nakurity_client.name,
+                            "data": {
+                                "message": message,
+                                "silent": True  # Keep events quieter in production
+                            }
+                        }
+                    
+                    await self.nakurity_client.intermediary_to_client(
+                        __import__("json").dumps(payload).encode()
+                    )
+                await asyncio.sleep(0)  # yield control
+            except Exception as e:
+                print(f"[Nakurity Link] error handling traffic item {item.get('traffic_id', 'unknown')}:", e)
+                # For critical errors, we might want to requeue the item
+                if "connection" in str(e).lower() or "websocket" in str(e).lower():
+                    print(f"[Nakurity Link] Connection error detected, requeuing item {item.get('traffic_id', 'unknown')}")
+                    await asyncio.sleep(1.0)
+                    await self.traffic.put(item)
+            finally:
+                self.traffic.task_done()
+
+    # ---------------------- #
+    #     Server Control     #
+    # ---------------------- #
+    async def start_link(self):
+        # spawn background processor
+        self._bg_task = asyncio.create_task(self._handle_traffic())
+        print("[Nakurity Link] started")
+
+    async def stop_link(self):
+        if self._bg_task:
+            self._bg_task.cancel()
+            try:
+                await self._bg_task
+            except asyncio.CancelledError:
+                pass
+        print("[Nakurity Link] stopped.")
+
+

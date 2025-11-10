@@ -7,7 +7,7 @@ from .server import NakurityBackend
 from .client import connect_outbound
 from .intercept_proxy import InterceptProxy, config_from_yaml
 from ..utils.loadconfig import load_config
-from .linker import NakurityLink
+#from .linker import NakurityLink
 
 """
 Entrypoint: runs intermediary (ws://127.0.0.1:8765) and the relay server (nakurity-backend) (ws://127.0.0.1:8000)
@@ -171,6 +171,19 @@ PORT = {
     "nakurity-client": int(cfg.get("nakurity-client", {}).get("port", 8000)),
 }
 
+
+
+
+
+
+#==========================================================================================================
+#==========================================================================================================
+#=================================      MAIN       ========================================================
+#==========================================================================================================
+#==========================================================================================================
+
+
+
 async def main():
     intermediary = Intermediary(host=HOST.get("intermediary"), port=PORT.get("intermediary"))
     nakurity_backend = NakurityBackend(intermediary)
@@ -187,12 +200,12 @@ async def main():
         return
     
     # now start the backend (it will be able to connect to the intermediary or be discoverable)
-    nakurity_task = asyncio.create_task(nakurity_backend.run_server(
+    backend_task = asyncio.create_task(nakurity_backend.run_server(
         host=HOST.get("nakurity-backend"),
         port=PORT.get("nakurity-backend")
     ))
 
-    tasks = [intermediary_task, nakurity_task] 
+    tasks = [intermediary_task, backend_task] 
 
     # Optional: start intercept proxy if enabled in config
     ip_cfg = cfg.get("intercept-proxy", {}) or {}
@@ -208,40 +221,44 @@ async def main():
     outbound_uri = f"ws://{HOST.get('nakurity-client')}:{PORT.get('nakurity-client')}"
     # create a background task which will attach a NakurityClient to the loop
     client = None
-    nk_link = None
+    #nk_link = None
     reconnect_in_progress = False
     
     async def setup_client_and_link(new_client):
-        nonlocal nk_link, client
+        nonlocal client #nk_link, client
         client = new_client
         if client:
             # store client instance for later use
-            nakurity_backend.outbound_client = client
+            intermediary.nakurity_client = client
             print("[Main] outbound client connected and stored")
             # set up NakurityLink tied to the connected client and attach to intermediary
-            nk_link = NakurityLink(client)
-            intermediary.nakurity_outbound_client = nk_link
-            tasks.append(asyncio.create_task(nk_link.start()))
+            #nk_link = intermediary #NakurityLink(client)
+            #intermediary.nakurity_outbound_client = nk_link
+            print("[Main] Starting intermediary link...")
+            tasks.append(asyncio.create_task(intermediary.start_link()))
             print("[Main] NakurityLink attached to intermediary")
             # Set up reconnection callback
             client._reconnect_callback = reconnect_client
     
     async def reconnect_client():
-        nonlocal reconnect_in_progress, client, nk_link
+        nonlocal reconnect_in_progress, client #, nk_link
         if reconnect_in_progress:
             return
+        
         reconnect_in_progress = True
         
         print("[Main] Connection lost, attempting to reconnect...")
         # Clean up old client
         if client and hasattr(client, '_reader_task') and client._reader_task:
             client._reader_task.cancel()
-        if nk_link:
-            await nk_link.stop()
-            intermediary.nakurity_outbound_client = None
+
+        if intermediary:
+            await intermediary.stop_link()
+            intermediary.nakurity_client = None
         
         # Attempt reconnection
-        new_client = await connect_outbound(outbound_uri, nakurity_backend._handle_intermediary_forward)
+        new_client = await connect_outbound(outbound_uri, intermediary )#._handle_intermediary_forward)
+        
         if new_client:
             print("[Main] Reconnection successful")
             await setup_client_and_link(new_client)
@@ -252,7 +269,7 @@ async def main():
     
     async def start_outbound():
         # pass backend forwarder so remote Neuro actions flow into our pipeline
-        new_client = await connect_outbound(outbound_uri, nakurity_backend._handle_intermediary_forward)
+        new_client = await connect_outbound(outbound_uri, intermediary )#._handle_intermediary_forward)
         if new_client is None:
             print("[Main] outbound client failed to connect initially, will retry on demand")
         else:

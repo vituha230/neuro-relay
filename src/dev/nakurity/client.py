@@ -3,33 +3,74 @@ import json
 import websockets
 import asyncio
 from neuro_api.api import AbstractNeuroAPI, NeuroAction
+#from .intermediary import Intermediary
 
 """
 A Neuro client that connects out to a real Neuro backend.
 """
 
 class NakurityClient(AbstractNeuroAPI):
-    def __init__(self, websocket, router_forward_cb):
+    def __init__(self, websocket, intermediary):
         self.websocket = websocket
         self.name = "neuro-relay"
         super().__init__(self.name)
         # router_forward_cb is expected to be an async callable that accepts a dict
         # e.g. intermediary._handle_intermediary_forward
-        self.router_forward_cb = router_forward_cb
+        #self.router_forward_cb = router_forward_cb
         self._reader_task: asyncio.Task | None = None
-        print("[Nakurity Client] has initialized.")
+        
         #self._recv_q = asyncio.Queue()
 
-    async def write_to_websocket(self, data: str):
-        await self.websocket.send(data)
+        self.intermediary = intermediary
 
-    async def read_from_websocket(self) -> str:
-        result = await self.websocket.recv()
-        return result
+        self.queue_intermediary = asyncio.Queue() #queue of messages from intermediary
+
+        #ratelimit settings
+        self.load = 0
+        self.maxload = 20
+        self.ratelimit_reset_time = 3
+        self.ratelimit_cooldown_time = 7
+
+        print("[Nakurity Client] has initialized.")
+
+    async def intermediary_to_client(self, msg: dict):
+        #called by intermediary: intermediary forwards data to client
+        await self.queue_intermediary.put(msg)
+
+
+    async def process_queue_intermediary(self):
+        while True:
+            if self.load <= self.maxload:
+                item = await self.queue_intermediary.get()
+                self.load += 1
+                print("[CLIENT] debug load: ", self.load, "/", self.maxload)
+                await self.send_to_neuro((json.dumps(item).encode()))
+            else:
+                await asyncio.sleep(0.5)
+                    
+                
+
+
+    async def ratelimiter(self): #DOES NOT AFFECT ACTION RESULTS. should it? idk
+        while True:
+            if self.load > self.maxload: #sent more than "maxload" messages in under "ratelimit_reset_time" seconds. Dont send any for "ratelimit_cooldown_time" seconds
+                await asyncio.sleep(self.ratelimit_cooldown_time) 
+                self.load = 0
+
+            self.load = 0
+            await asyncio.sleep(self.ratelimit_reset_time)
+            # i dont like this mechanism 
+
+
+
+
 
     async def initialize(self):
         # Send required startup to set game/title on backend
         try:
+            asyncio.create_task(self.process_queue_intermediary()) # create task for processing messages from intermediary
+            asyncio.create_task(self.ratelimiter())
+
             await self.send_startup_command()
             print("[Nakurity Client] Startup command sent successfully")
         except Exception as e:
@@ -39,6 +80,13 @@ class NakurityClient(AbstractNeuroAPI):
         # actions_schema = await self.collect_registered_actions()
         # if actions_schema:
         #     await self.register_actions(actions_schema)
+
+
+    async def send_to_neuro(self, command_bytes: bytes):
+        """Send formatted neuro command bytes to the real neuro backend."""
+        await self.send_command_data(command_bytes)
+
+
 
     async def handle_action(self, action: NeuroAction):
         # Actions from real Neuro backend flow back to intermediary → integrations
@@ -51,12 +99,21 @@ class NakurityClient(AbstractNeuroAPI):
         print(f"[Nakurity Client] ========================================")
         
         try:
+            """
             result = await self.router_forward_cb({
                 "from_neuro_backend": True,
                 "action": action.name,
                 "data": action.data or "{}", #json.loads(action.data or "{}"),
                 "id": action.id_
             })
+            """
+            result = await self.intermediary.client_to_intermediary({
+                "from_neuro_backend": True,
+                "action": action.name,
+                "data": action.data or "{}", #json.loads(action.data or "{}"),
+                "id": action.id_
+            })
+
             print(f"[Nakurity Client] router_forward_cb returned: {result}")
             
             # Send success result back to Tony
@@ -73,6 +130,9 @@ class NakurityClient(AbstractNeuroAPI):
             traceback.print_exc()
             await self.send_action_result(action.id_, False, f"Relay error: {str(e)}")
 
+
+
+
     async def collect_registered_actions(self):
         """Ask the intermediary (via router callback) for available actions."""
         try:
@@ -81,6 +141,8 @@ class NakurityClient(AbstractNeuroAPI):
         except Exception as e:
             print(f"[Nakurity Client] failed to collect actions: {e}")
             return {}
+
+
 
     async def register_actions(self, actions_schema: dict):
         """Register integration actions with Neuro backend."""
@@ -112,19 +174,9 @@ class NakurityClient(AbstractNeuroAPI):
             "data": {"actions": actions_list}
         }
         print(f"[Nakurity Client] Registering {len(actions_list)} actions with Neuro backend")
-        await self.send_command_data(json.dumps(payload).encode())
+        await self.send_to_neuro(json.dumps(payload).encode())
 
 
-    async def on_connect(self):
-        print("[Nakurity Client] connected")
-
-    async def on_disconnect(self):
-        print("[Nakurity Client] disconnected")
-
-    async def send_to_neuro(self, command_bytes: bytes):
-        """Send formatted neuro command bytes to the real neuro backend."""
-        await self.send_command_data(command_bytes)
-    
     async def _read_loop(self):
         try:
             while True:
@@ -140,7 +192,28 @@ class NakurityClient(AbstractNeuroAPI):
             if hasattr(self, '_reconnect_callback'):
                 asyncio.create_task(self._reconnect_callback())
 
-async def connect_outbound(uri: str, router_forward_cb, max_retries: int = 10, retry_delay: float = 2.0):
+    async def write_to_websocket(self, data: str):
+        await self.websocket.send(data)
+
+    async def read_from_websocket(self) -> str:
+        result = await self.websocket.recv()
+        return result
+    
+
+
+    async def on_connect(self):
+        print("[Nakurity Client] connected")
+
+    async def on_disconnect(self):
+        print("[Nakurity Client] disconnected")
+
+
+
+
+
+
+
+async def connect_outbound(uri: str, intermediary, max_retries: int = 10, retry_delay: float = 2.0):
     """
     Connect to the real neuro backend and return NakurityClient instance with retry logic.
     This function will create a background read loop for the websocket.
@@ -164,7 +237,7 @@ async def connect_outbound(uri: str, router_forward_cb, max_retries: int = 10, r
 
     try:
         print("[Nakurity Client] starting connection to neuro backend", uri)
-        c = NakurityClient(ws, router_forward_cb)
+        c = NakurityClient(ws, intermediary)
         await c.initialize()
         # start background read loop
         loop = asyncio.get_event_loop()
@@ -178,3 +251,13 @@ async def connect_outbound(uri: str, router_forward_cb, max_retries: int = 10, r
         except Exception:
             pass
         return None
+
+
+#========================================================================================================================================
+#========================================================================================================================================
+#========================================================================================================================================
+#UNUSED. YET...
+
+
+
+
